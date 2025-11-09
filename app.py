@@ -4,6 +4,7 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
+import pandas as pd
 
 USE_CLAHE = True
 K_CAP = 150
@@ -62,14 +63,15 @@ def vec_to_img_uint8(vec, img_shape):
 class EightFolderPCAApp:
     def __init__(self, master):
         self.master = master
-        master.title("8-Folder PCA Averaging System")
-        master.geometry("1600x900")
+        master.title("8-Folder PCA Averaging System with Face Ranking")
+        master.geometry("1600x950")
         master.resizable(True, True)
 
         self.folders = [None] * 8
         self.folder_data = [None] * 8  
         self.global_result = None 
         self.all_global_coeffs = None 
+        self.all_items_info = []  # Store (filepath, vector, folder_idx) for all images
         
         self.photos = [None] * 9  # 8 folders + 1 global
         self.random_photos = [None] * 5  # 5 random samples
@@ -120,6 +122,12 @@ class EightFolderPCAApp:
                                    command=self.generate_random_samples, state=tk.DISABLED,
                                    font=("Arial", 8), bg="#9C27B0", fg="white")
         self.btn_random.pack(side="left", padx=3)
+        
+        # NEW: Face Ranking Button
+        self.btn_rank = tk.Button(btn_frame, text="Rank All Images by Reference Face", 
+                                 command=self.rank_by_reference_face, state=tk.DISABLED,
+                                 font=("Arial", 8, "bold"), bg="#FF5722", fg="white")
+        self.btn_rank.pack(side="left", padx=3)
 
         self.lbl_status = tk.Label(top, text="Waiting for folders...", 
                                   font=("Arial", 7), fg="blue", 
@@ -232,6 +240,7 @@ class EightFolderPCAApp:
             self.progress['value'] = 0
             self.master.update_idletasks()
             all_items = []  
+            self.all_items_info = []  # Reset
             
             # Process each folder
             for i, folder in enumerate(self.folders):
@@ -245,6 +254,10 @@ class EightFolderPCAApp:
                     messagebox.showwarning("Warning", 
                         f"Folder {i+1} has less than 2 images. Skipping.")
                     continue
+                
+                # Store items with folder information
+                for fpath, vec in items:
+                    self.all_items_info.append((fpath, vec, i))  # (filepath, vector, folder_index)
                 
                 all_items.extend(items)
                 
@@ -314,13 +327,14 @@ class EightFolderPCAApp:
             self.lbl_status.config(text=f"✓ Complete! Processed {len(all_items)} total images across 8 folders.")
             self.btn_save.config(state=tk.NORMAL)
             self.btn_random.config(state=tk.NORMAL)
+            self.btn_rank.config(state=tk.NORMAL)  # Enable ranking button
             
             messagebox.showinfo("Success", 
                 f"Processing complete!\n\n"
                 f"• 8 folder averages created\n"
                 f"• 1 global average from {len(all_items)} images\n\n"
                 f"PCA space has {self.all_global_coeffs.shape[1]} dimensions\n"
-                f"Click 'Generate 5 Random Samples' to sample from the sphere!")
+                f"Click 'Rank All Images' to compare with a reference face!")
 
         except Exception as e:
             messagebox.showerror("Error", f"Processing failed:\n{str(e)}")
@@ -433,6 +447,115 @@ class EightFolderPCAApp:
             
         except Exception as e:
             messagebox.showerror("Error", f"Random sampling failed:\n{str(e)}")
+
+    def rank_by_reference_face(self):
+        """NEW FEATURE: Rank all 50 images by distance to a reference face"""
+        try:
+            if self.global_result is None:
+                messagebox.showerror("Error", "Process folders first!")
+                return
+            
+            # Ask user to select reference face image
+            ref_path = filedialog.askopenfilename(
+                title="Select Reference Face Image",
+                filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff")]
+            )
+            
+            if not ref_path:
+                return
+            
+            self.lbl_status.config(text="Processing reference face and ranking images...")
+            self.progress['value'] = 0
+            self.master.update_idletasks()
+            
+            # Load and preprocess reference image
+            ref_bgr = cv2.imread(ref_path)
+            if ref_bgr is None:
+                messagebox.showerror("Error", "Cannot read reference image!")
+                return
+            
+            ref_gray = preprocess_bgr(ref_bgr)
+            ref_vec = ref_gray.flatten().astype(np.float32)
+            
+            # Project reference face to global PCA space
+            global_mean, global_eigvecs, _, _ = self.global_result
+            ref_coeffs = project_to_pca(ref_vec, global_mean, global_eigvecs)
+            
+            self.progress['value'] = 30
+            self.master.update_idletasks()
+            
+            # Calculate distances to all images
+            distances = []
+            for fpath, vec, folder_idx in self.all_items_info:
+                # Project image to PCA space
+                img_coeffs = project_to_pca(vec, global_mean, global_eigvecs)
+                
+                # Calculate Euclidean distance in PCA space
+                distance = np.linalg.norm(ref_coeffs - img_coeffs)
+                
+                # Extract person name and expression
+                folder_name = os.path.basename(self.folders[folder_idx])
+                img_name = os.path.splitext(os.path.basename(fpath))[0]
+                
+                # Format: PersonName_Expression
+                label = f"{folder_name}_{img_name}"
+                
+                distances.append({
+                    'distance': distance,
+                    'label': label,
+                    'filepath': fpath,
+                    'folder': folder_name,
+                    'image': img_name
+                })
+            
+            self.progress['value'] = 70
+            self.master.update_idletasks()
+            
+            # Sort by distance (closest first)
+            distances.sort(key=lambda x: x['distance'])
+            
+            # Create DataFrame for Excel export
+            df_data = []
+            for rank, item in enumerate(distances, start=1):
+                df_data.append({
+                    'Rank': rank,
+                    'Image': item['label']
+                })
+            
+            df = pd.DataFrame(df_data)
+            
+            self.progress['value'] = 90
+            self.master.update_idletasks()
+            
+            # Ask user where to save Excel file
+            save_path = filedialog.asksaveasfilename(
+                title="Save Ranking Results",
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")]
+            )
+            
+            if save_path:
+                # Save to Excel
+                df.to_excel(save_path, index=False, sheet_name='Face Rankings')
+                
+                self.progress['value'] = 100
+                self.lbl_status.config(text=f"✓ Ranking complete! Results saved to: {save_path}")
+                
+                # Show summary
+                top_5 = "\n".join([f"{i+1}. {distances[i]['label']} (dist: {distances[i]['distance']:.2f})" 
+                                  for i in range(min(5, len(distances)))])
+                
+                messagebox.showinfo("Ranking Complete", 
+                    f"Successfully ranked {len(distances)} images!\n\n"
+                    f"Reference: {os.path.basename(ref_path)}\n\n"
+                    f"Top 5 closest matches:\n{top_5}\n\n"
+                    f"Full results saved to:\n{save_path}")
+            else:
+                self.lbl_status.config(text="Ranking cancelled - file not saved.")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Ranking failed:\n{str(e)}")
+            self.lbl_status.config(text=f"Error: {str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()
