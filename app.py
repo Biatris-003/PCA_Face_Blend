@@ -129,6 +129,12 @@ class EightFolderPCAApp:
                                  font=("Arial", 8, "bold"), bg="#FF5722", fg="white")
         self.btn_rank.pack(side="left", padx=3)
 
+        # NEW: Emotion Changes Button
+        self.btn_emotion = tk.Button(btn_frame, text="Detect Emotion Changes (49x8 sheet)",
+                                     command=self.detect_emotion_changes, state=tk.DISABLED,
+                                     font=("Arial", 8), bg="#607D8B", fg="white")
+        self.btn_emotion.pack(side="left", padx=3)
+
         self.lbl_status = tk.Label(top, text="Waiting for folders...", 
                                   font=("Arial", 7), fg="blue", 
                                   wraplength=1550, justify="left")
@@ -328,6 +334,7 @@ class EightFolderPCAApp:
             self.btn_save.config(state=tk.NORMAL)
             self.btn_random.config(state=tk.NORMAL)
             self.btn_rank.config(state=tk.NORMAL)  # Enable ranking button
+            self.btn_emotion.config(state=tk.NORMAL)  # Enable emotion-detection button
             
             messagebox.showinfo("Success", 
                 f"Processing complete!\n\n"
@@ -555,6 +562,169 @@ class EightFolderPCAApp:
                 
         except Exception as e:
             messagebox.showerror("Error", f"Ranking failed:\n{str(e)}")
+            self.lbl_status.config(text=f"Error: {str(e)}")
+
+    def detect_emotion_changes(self):
+        """Compare each folder's Happy/Happiness face to *all* images (rows ≈ 50).
+
+        Behaviour tweaks requested by the user:
+        - Target image per folder: look for filenames containing 'happy' or 'happiness'
+          (case-insensitive). If none found, fall back to the first image in the folder.
+        - Distance scores are computed in the *global* PCA coefficient space.
+        - Keep all images as rows (including the target one). When the row image matches the
+          target Happy image for a person, place '_' instead of 0 in the output table to signal
+          "same image" while preserving the 50×8 layout.
+        - Produce an Excel workbook with two sheets:
+            • 'Distances' → table of distances / '_' markers.
+            • 'Closest'   → summary of the closest *other* image per person (same-image rows ignored).
+        """
+        try:
+            if self.global_result is None or self.all_items_info is None:
+                messagebox.showerror("Error", "Process folders first!")
+                return
+
+            self.lbl_status.config(text="Computing emotion-changes report...")
+            self.progress['value'] = 0
+            self.master.update_idletasks()
+
+            global_mean, global_eigvecs, _, _ = self.global_result
+
+            # Build list of target Happy/Happiness images for each folder
+            targets = [None] * 8
+            for i, folder in enumerate(self.folders):
+                if folder is None:
+                    targets[i] = None
+                    continue
+
+                # Collect candidate files for this folder from all_items_info
+                candidates = [(fpath, vec) for fpath, vec, fi in self.all_items_info if fi == i]
+                if not candidates:
+                    targets[i] = None
+                    continue
+
+                # Try to find an explicit happy/happiness filename (case-insensitive)
+                happy_fpath = None
+                candidates_sorted = sorted(candidates, key=lambda item: os.path.basename(item[0]).lower())
+                for fpath, vec in candidates_sorted:
+                    name = os.path.basename(fpath).lower()
+                    if 'happy' in name or 'happiness' in name or 'hapiness' in name:
+                        happy_fpath = fpath
+                        break
+
+                if happy_fpath is None:
+                    # Fallback: pick the first filename in sorted order
+                    happy_fpath = candidates_sorted[0][0]
+
+                # Retrieve the vector for the chosen target image
+                happy_vec = next((v for f, v, fi in self.all_items_info if f == happy_fpath), None)
+                targets[i] = (happy_fpath, happy_vec)
+
+            self.progress['value'] = 20
+            self.master.update_idletasks()
+
+            # Precompute PCA coefficients for every image
+            coeffs_map = {}
+            for fpath, vec, fi in self.all_items_info:
+                coeffs_map[fpath] = project_to_pca(vec, global_mean, global_eigvecs)
+
+            self.progress['value'] = 50
+            self.master.update_idletasks()
+
+            # Build table: rows = all images (keep target rows, mark as '_'), cols = persons
+            all_items_sorted = sorted(self.all_items_info, key=lambda item: os.path.basename(item[0]).lower())
+            if not all_items_sorted:
+                messagebox.showwarning("Warning", "No images found to analyse.")
+                return
+
+            def build_row_label(fpath, folder_idx):
+                folder_name = os.path.basename(self.folders[folder_idx]) if self.folders[folder_idx] else f"Folder{folder_idx+1}"
+                image_name = os.path.splitext(os.path.basename(fpath))[0]
+                return f"{folder_name}_{image_name}"
+
+            row_labels = [build_row_label(fpath, folder_idx) for fpath, _, folder_idx in all_items_sorted]
+            col_labels = [os.path.basename(self.folders[i]) if self.folders[i] else f"Folder{i+1}" for i in range(8)]
+
+            data_display = {col: [] for col in col_labels}
+            data_numeric = {col: [] for col in col_labels}
+
+            for fpath, vec, folder_idx in all_items_sorted:
+                img_coeffs = coeffs_map.get(fpath)
+                for i, col in enumerate(col_labels):
+                    target = targets[i]
+                    if target is None or target[1] is None:
+                        data_display[col].append("")
+                        data_numeric[col].append(np.nan)
+                        continue
+
+                    target_path, _ = target
+                    target_coeffs = coeffs_map.get(target_path)
+                    if target_coeffs is None or img_coeffs is None:
+                        data_display[col].append("")
+                        data_numeric[col].append(np.nan)
+                        continue
+
+                    if fpath == target_path:
+                        data_display[col].append("_")
+                        data_numeric[col].append(np.nan)
+                    else:
+                        dist = float(np.linalg.norm(target_coeffs - img_coeffs))
+                        data_display[col].append(dist)
+                        data_numeric[col].append(dist)
+
+            df_numeric = pd.DataFrame(data_numeric, index=row_labels, dtype=float)
+
+            # Format display DataFrame (round floats, keep '_' and blanks)
+            def format_cell(val):
+                if isinstance(val, str):
+                    return val
+                if pd.isna(val):
+                    return ""
+                return round(float(val), 4)
+
+            df_display = pd.DataFrame(data_display, index=row_labels).applymap(format_cell)
+
+            self.progress['value'] = 80
+            self.master.update_idletasks()
+
+            # For each person, get the closest match
+            closest_rows = []
+            for col in col_labels:
+                series = df_numeric[col].dropna()
+                if series.empty:
+                    closest_rows.append({'Person': col, 'Closest_Image': None, 'Distance': np.nan})
+                else:
+                    idx = series.idxmin()
+                    closest_rows.append({'Person': col, 'Closest_Image': idx, 'Distance': round(float(series.min()), 4)})
+
+            df_closest = pd.DataFrame(closest_rows)
+
+            # Ask user where to save
+            save_path = filedialog.asksaveasfilename(
+                title="Save Emotion Changes Report",
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")]
+            )
+
+            if save_path:
+                with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
+                    df_display.to_excel(writer, sheet_name='Distances')
+                    df_closest.to_excel(writer, sheet_name='Closest', index=False)
+
+                self.progress['value'] = 100
+                self.lbl_status.config(text=f"✓ Emotion changes report saved to: {save_path}")
+
+                top_lines = "\n".join([
+                    f"{r['Person']}: {r['Closest_Image']} (dist: {r['Distance']:.2f})" 
+                    for r in closest_rows if r['Closest_Image']
+                ])
+
+                messagebox.showinfo("Emotion Changes Report",
+                    f"Emotion changes report saved!\n\nTop closest per person:\n\n{top_lines}")
+            else:
+                self.lbl_status.config(text="Emotion changes cancelled - file not saved.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Emotion changes failed:\n{str(e)}")
             self.lbl_status.config(text=f"Error: {str(e)}")
 
 if __name__ == "__main__":
